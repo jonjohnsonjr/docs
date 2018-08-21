@@ -29,7 +29,7 @@ spec:
           name: kanikythe
           arguments:
           - name: IMAGE
-            value: &image gcr.io/jonjohnson-test/kythe/skaffold-web
+            value: &image gcr.io/jonjohnson-test/kythe/web/skaffold
           - name: PACKAGE
             value: github.com/GoogleContainerTools/skaffold
       revisionTemplate:
