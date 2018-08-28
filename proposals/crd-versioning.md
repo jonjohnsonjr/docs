@@ -12,6 +12,16 @@ requires some effort from CRD Authors.
 * [Conversion Proposal](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/api-machinery/customresource-conversion-webhook.md)
 * [Conversion tracking issue](https://github.com/kubernetes/features/issues/598)
 
+### Timeline
+
+* Now: [Validation](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/#validation).
+	* This is a prereq for Conversion and [Pruning](https://github.com/kubernetes/features/issues/575). We should implement this now.
+* 1.11: [Versioning](#versioning) in Alpha.
+	* This is not particularly useful until Conversion lands, but that's very far out (Q2 2019).
+	* We can use this to implement an [conversion controller](#conversion-controller) to do conversion "manually".
+* 1.13: [Conversion](#conversion) in Beta.
+	* First-class conversion rolls out; we stop using the conversion controller.
+
 ### Versioning
 
 Versioning has landed as alpha in 1.11. This just includes versioning without
@@ -32,9 +42,6 @@ type CustomResourceDefinitionSpec struct {
   // TODO: where can we find the "kube-like" sorting implementation?
   // Note: the ordering here is different from what was in the proposal.
   Versions []CustomResourceDefinitionVersion
-
-  // Shared by all Versions, configuration for the conversion webhook.
-  Conversion *CustomResourceConversion
 
   // ...
 }
@@ -61,6 +68,8 @@ type CustomResourceDefinitionVersion struct {
 
 ### Conversion
 
+Conversion is expected to land as alpha in 1.12.
+
 Conversion between versions is done via a webhook.
 There is one conversion webhook per CRD `Group`.
 It needs to handle conversion between any two versions, responding to a `ConversionRequest`
@@ -85,10 +94,49 @@ type ConversionResponse struct {
 }
 ```
 
-[Example of handling a `ConversionRequest`.]( https://github.com/kubernetes/community/blob/master/contributors/design-proposals/api-machinery/customresource-conversion-webhook.md#examples)
+Relevant changes to `CustomResourceDefinitionSpec`:
+
+```go
+type CustomResourceDefinitionSpec struct {
+  // ...
+
+  // Shared by all Versions, configuration for the conversion webhook.
+  Conversion *CustomResourceConversion
+
+  // ...
+}
+```
+
+[Example of handling a `ConversionRequest`.](https://github.com/kubernetes/community/blob/master/contributors/design-proposals/api-machinery/customresource-conversion-webhook.md#examples)
+
+#### Dynamic Certificates
+
+In `pkg/webhook`, we [dynamically generate certificates](https://github.com/knative/pkg/blob/eedc0a939db24a877b93b6e90c95ebb8591911bb/webhook/webhook.go#L272).
+This precludes us defining our CRDs as static yaml (as we currently do), since
+we won't know the Conversion webhook configuration until after our
+`pkg/webhook` process comes online.
+
+To fix that, we'll need to have the webhook register our CRDs for us.
+
+TODO: What is the best way to do that?
+
+Options:
+* Just inline the spec directly into `cmd/webhook/main.go` (or under `pkg/apis`)?
+* Move the yamls under `cmd/webhook` and jsonpatch the webhook config?
 
 
 ## Impl
+
+We'll separate this implementation into two pieces:
+
+1. A `Convertible` interface for `pkg/webhook` that maps directly to the k8s
+   conversion webhook implementation. This allows flexibility for the consumers
+	 of `pkg/webhook` to implement their conversion in any way.
+2. A `SimpleConverter` interface for a new package, `pkg/convert`, that makes
+   the implementation easier. This is a bit more opinionated, and assumes
+	 that users will always want to do "one hop" upgrade/downgrades.
+	 This package makes satisfying the above `Convertible` interface simpler,
+	 but its use is optional.
 
 ### knative/pkg/webhook
 
@@ -133,40 +181,96 @@ are [ordered](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-reso
 Library users essentially just have to implement a doubly linked list of
 conversion functions between adjacent versions.
 
-We need users to provide something that maps versions to individual
-conversion functions, then we can produce an implementation of the
-`Convertible` interface for them, e.g.:
+We define a `SimpleConverter` interface that allows upgrading from an older
+package and downgrading to an older package. By structuring it this way (new
+packages depend only on the adjacent, older package), we avoid dependency
+cycles.
 
 ```go
-package convert
-
-// TODO: Find better names for this stuff.
-type ConversionMapping struct {
-  OriginalVersion string
-  DesiredVersion  string
-  Convert func (runtime.RawExtension) (runtime.RawExtension, error)
-}
-
-func MakeConvertFunction(cms []ConversionMapping) func (in runtime.RawExtension, version string) (*runtime.RawExtension, error) {
-  // Return a function that walks through `cms`, upgrading/downgrading until we reach desired `version`.
+type SimpleConverter interface {
+	UpgradeFrom(old runtime.RawExtension) (*runtime.RawExtension, error)
+	Downgrade() (*runtime.RawExtension, error)
 }
 ```
 
-We can also help validate that they have complete coverage for all the versions
-in a CRD Spec.
-```go
-func Validate(cms []ConversionMapping, spec CustomResourceDefinitionSpec) error {
-  // Validate that it's possible to reach any version in spec.Versions from any other version.
-  // We don't need to call any `Convert` functions, just that there are edges between
-  // every version in `cms`.
+E.g. a newer `v1alpha2` package is responsible for both upgrading from and
+downgrading to the older `v1alpha1` package.
+
+```
+func downgradeFromAlpha2ToAlpha1() {
+  v1alpha1Foo, err := v1alpha2.Downgrade()
+  // ...
+}
+
+func upgradeFromAlpha1ToAlpha2() {
+  v1alpha2Foo, err := v1alpha2.UpgradeFrom(v1alpha1Foo)
+  // ...
 }
 ```
 
-This is probably overkill for CRDs that have only 2 or 3 different versions.
-They would probably want to implement the `Convertible` interface directly,
-but as the number of possible conversion invocations grows pretty quickly,
-for `N` versions, there are `N * N-1` combinations of versions. The above
-scheme reduces that to `2N - 2`.
+We can potentially use some reflection/codegen to make this nicer, i.e. more
+typesafe. Ideally, v1alpha2's implementation would look like this instead:
+
+```go
+func UpgradeFrom(old *v1alpha1.Foo) (*Foo, error) {
+	// Do some upgrading.
+}
+
+func (f *Foo) Downgrade() (*v1alpha1.Foo, error)
+	// Do some downgrading.
+}
+```
+
+### Conversion Controller
+
+(May be a Conversion Job instead.)
+
+CRD [Conversion](#conversion) is pretty far out (Q2 2019).
+The docs describe a [manual upgrade process](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definition-versioning/#upgrade-existing-objects-to-a-new-stored-version) to use in the meantime:
+
+1. Set `v1` as the storage in the CustomResourceDefinition file and apply it using kubectl. The `storedVersions` is now `v1beta1`, `v1`.
+1. Write an upgrade procedure to list all existing objects and write them with the same content. This forces the backend to write objects in the current storage version, which is `v1`.
+1. Update the CustomResourceDefinition `Status` by removing `v1beta1` from `storedVersions` field.
+
+Since we'd like to upgrade CRDs before that, we need an alternative
+implementation. We can implement a controller to do the above process, but
+less manually.
+
+In a perfect world, we'd just need something like this:
+
+```yaml
+apiVersion: pkg.knative.dev/v1alpha1
+kind: Conversion
+metadata:
+  name: upgrade-services
+  namespace: default
+spec:
+  group: serving.knative.dev
+  oldVersion: v1alpha1
+  newVersion: v1alpha2
+  kind: CustomResourceDefinition
+  # More restrictions? Upgrade individual instances of a CRD? Selectors?
+```
+
+TODO: Define the `Conversion` CRD spec.
+
+TODO: What kind of access do we need to be allowed to perform this?
+
+We'll need some way to invoke the `Convert` method of `GenericCRD`.
+We can do the same thing that we do in `pkg/webhook` library , i.e.:
+
+* Create a `ConversionController` analogous to the [`AdmissionController`](https://github.com/knative/pkg/blob/eedc0a939db24a877b93b6e90c95ebb8591911bb/webhook/webhook.go#L109).
+* Accept a list of [Handlers](https://github.com/knative/pkg/blob/eedc0a939db24a877b93b6e90c95ebb8591911bb/webhook/webhook.go#L112) that implement the `Convertible` interface.
+* Use `pkg/controller` to implement a CRD that reconciles old versions to the new version by calling `Convert`.
+
+Once the conversion webhook stuff lands, we can just rip this out or move it
+into `pkg/webhook`.
+
+Questions:
+
+* If the CRD to be upgraded isn't registered or doesn't implement `Convertible`, we could still do a simple NOP upgrade that just reads the old version and writes it as the new version. Is that worth doing? (I think probably not.)
+* Does it make more sense for this to just be a Job? It's more or less a one-off thing. Being an ongoing process makes it more similar to the actual conversion webhook, though...
+
 
 ## Testing
 
@@ -178,7 +282,6 @@ for individual conversions, something like:
 ```go
 type TableRow struct {
   Name    string
-  Version string
   Input   runtime.RawExtension
   Output  runtime.RawExtension
   Error   error
@@ -202,6 +305,8 @@ to the latest version (at HEAD), and define a set of e2e tests that exclusively
 exercise the upgrade/downgrade of CRDs. It might make sense to define a min/max
 version for which one of these tests is valid, but for now let's assume a simple
 test that should be valid for any CRD version.
+
+TODO: We can probably just use go build tags to differentiate these tests.
 
 Since the complete list of versions is specified in the CRD Spec
 (`Versions []CustomResourceDefinitionVersion`), we can use that to drive these
@@ -251,6 +356,12 @@ func RunCRDVersionTest(t, *testing.T, cvt CRDVersionTest) {
 	}
 }
 ```
+
+TODO: Sequence diagrams.
+
+## Support
+
+[TODO](https://kubernetes.io/docs/reference/using-api/deprecation-policy/)
 
 ## Questions
 
