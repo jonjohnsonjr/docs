@@ -9,9 +9,6 @@
 <li>
 <a href="#serving.knative.dev">serving.knative.dev</a>
 </li>
-<li>
-<a href="#serving.knative.dev">serving.knative.dev</a>
-</li>
 </ul>
 <h2 id="autoscaling.internal.knative.dev">autoscaling.internal.knative.dev</h2>
 <p>
